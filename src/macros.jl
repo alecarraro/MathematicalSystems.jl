@@ -148,16 +148,23 @@ julia> _corresponding_type(AbstractContinuousSystem, ((:A), (:B), (:X), (:U)))
 ConstrainedLinearControlContinuousSystem
 ```
 """
-function _corresponding_type(AT::Type{<:AbstractSystem}, fields::Tuple)
+function _corresponding_type(AT::Type{<:AbstractSystem}, fields::Tuple,
+                              is_parametric::Bool)
     TYPES = types_table(AT)
+    parametric_MATCH = [isparametric(S) for S in TYPES]
+    if is_parametric
+        idx_parametric = findall(parametric_MATCH)
+    else
+        idx_parametric = findall(!, parametric_MATCH)
+    end
     FIELDS = fields_table(AT)
-    idx = findall(x -> issetequal(fields, x), FIELDS)
+    idx = findall(x -> issetequal(fields, x), FIELDS[idx_parametric])
     if isempty(idx)
         throw(ArgumentError("the entry $(fields) does not match a " *
                             "`MathematicalSystems.jl` structure"))
     end
     @assert length(idx) == 1 "found more than one compatible system type"
-    return TYPES[idx][1]
+    return TYPES[idx_parametric][idx][1]
 end
 
 """
@@ -249,6 +256,8 @@ function _parse_system(exprs::NTuple{N,Expr}) where {N}
     dynamic_equation = nothing
     AT = nothing
     constraints = Vector{Expr}()
+    param_defs = Dict{Symbol,Symbol}()
+    is_parametric = false
 
     # define defaults for state, noise and input symbol and default dimension
     default_input_var = :u
@@ -306,8 +315,10 @@ function _parse_system(exprs::NTuple{N,Expr}) where {N}
             end
             initial_state = X0
 
-        elseif @capture(ex, state_ ∈ Set_)  # COV_EXCL_LINE
-            push!(constraints, ex)  # parse a constraint
+        elseif @capture(ex, v_ ∈ S_)
+            # parse a constraint or a parameter definition
+            # for now we just store it and post-process later
+            push!(constraints, ex)
 
         elseif @capture(ex, (input:u_) | (u_:input))  # COV_EXCL_LINE
             input_var = u  # parse an input symbol
@@ -326,10 +337,6 @@ function _parse_system(exprs::NTuple{N,Expr}) where {N}
 
     # error handling for the given equations
     isnothing(dynamic_equation) && throw(ArgumentError("the dynamic equation was not found"))
-
-    # error handling for the given set constraints
-    nsets = length(constraints)
-    nsets > 3 && throw(ArgumentError("cannot parse $nsets set constraints"))
 
     # error handling for variable names
     isnothing(state_var) && throw(ArgumentError("the state variable was not found"))
@@ -351,8 +358,26 @@ function _parse_system(exprs::NTuple{N,Expr}) where {N}
         noise_var = default_noise_var
     end
 
-    return dynamic_equation, AT, constraints,
-           state_var, input_var, noise_var, dimension, initial_state
+    # post-process constraints to distinguish between state/input/noise constraints
+    # and parameter definitions
+    actual_constraints = Vector{Expr}()
+    for ex in constraints
+        @capture(ex, v_ ∈ S_)
+        if v == state_var || v == input_var || v == noise_var
+            push!(actual_constraints, ex)
+        else
+            param_defs[v] = S
+            is_parametric = true
+        end
+    end
+
+    # error handling for the given set constraints
+    nsets = length(actual_constraints)
+    nsets > 3 && throw(ArgumentError("cannot parse $nsets set constraints"))
+
+    return dynamic_equation, AT, actual_constraints,
+           state_var, input_var, noise_var, dimension, initial_state,
+           is_parametric, param_defs
 end
 
 """
@@ -389,7 +414,8 @@ and the second argument of the tuple corresponds to the field parameter.
 Two arrays of tuples containing the value and field parameters for the right-hand
 and left-hand side of the dynamic equation `equation`.
 """
-function extract_dyn_equation_parameters(equation, state, input, noise, dim, AT)
+function extract_dyn_equation_parameters(equation, state, input, noise, dim, AT,
+                                         param_defs)
     @capture(equation, lhs_ = rhscode_)
     lhs_params = Vector{Tuple{Any,Symbol}}()
     rhs_params = Vector{Tuple{Any,Symbol}}()
@@ -405,7 +431,7 @@ function extract_dyn_equation_parameters(equation, state, input, noise, dim, AT)
     if @capture(rhs, A_ + B__)
         # parse summands of rhs and add * if needed
         summands = add_asterisk.([A, B...], Ref(state), Ref(input), Ref(noise))
-        push!(rhs_params, extract_sum(summands, state, input, noise)...)
+        push!(rhs_params, extract_sum(summands, state, input, noise, param_defs)...)
         # if rhs is a function call except `*` or `-` => black-box system
     elseif @capture(rhs, f_(a__)) && f != :(*) && f != :(-)
         # the dimension argument needs to be a iterable
@@ -441,7 +467,11 @@ function extract_dyn_equation_parameters(equation, state, input, noise, dim, AT)
                     if state == var # rhs = A_x_ or rhs= A_*x_
                         value = tryparse(Float64, string(array))
                         if isnothing(value) # e.g. => rhs = Ax
-                            push!(rhs_params, (array, :A))
+                            if haskey(param_defs, array)
+                                push!(rhs_params, (param_defs[array], :A))
+                            else
+                                push!(rhs_params, (array, :A))
+                            end
                         else # => e.g., rhs = 2x
                             push!(rhs_params, (value * Id(dim), :A))
                         end
@@ -584,7 +614,8 @@ and the field name is `:B`.
 Similiarily, if the element is equal to `noise`, the variable name is
 `IdentityMultiple(I, state_dim)` and the field name is `:D`.
 """
-function extract_sum(summands, state::Symbol, input::Symbol, noise::Symbol)
+function extract_sum(summands, state::Symbol, input::Symbol, noise::Symbol,
+                     param_defs)
     params = Tuple{Any,Symbol}[]
     state_dim = 1
     got_state_dim = false
@@ -597,14 +628,22 @@ function extract_sum(summands, state::Symbol, input::Symbol, noise::Symbol)
     for summand in summands
         if @capture(summand, array_ * var_)
             if state == var
-                push!(params, (Expr(:call, :hcat, array), :A))
+                if haskey(param_defs, array)
+                    push!(params, (param_defs[array], :A))
+                else
+                    push!(params, (Expr(:call, :hcat, array), :A))
+                end
                 # obtain "state_dim" for later using in IdentityMultiple
                 state_dim = Expr(:call, :size, :($array), 1)
                 got_state_dim = true
                 num_state_assignments += 1
 
             elseif input == var
-                push!(params, (Expr(:call, :hcat, array), :B))
+                if haskey(param_defs, array)
+                    push!(params, (param_defs[array], :B))
+                else
+                    push!(params, (Expr(:call, :hcat, array), :B))
+                end
                 num_input_assignments += 1
 
             elseif noise == var
@@ -873,12 +912,14 @@ ConstrainedBlackBoxControlDiscreteSystem{typeof(f), BallInf{Float64, Vector{Floa
 """
 macro system(expr...)
     try
-        dyn_eq, AT, constr, state, input, noise, dim, x0 = _parse_system(expr)
-        lhs, rhs = extract_dyn_equation_parameters(dyn_eq, state, input, noise, dim, AT)
+        dyn_eq, AT, constr, state, input, noise, dim, x0, is_parametric, param_defs = _parse_system(expr)
+        lhs, rhs = extract_dyn_equation_parameters(dyn_eq, state, input, noise, dim, AT,
+                                                 param_defs)
         ordered_rhs = _sort(rhs, (:A, :B, :c, :D, :f, :statedim, :inputdim, :noisedim))
         ordered_set = _sort(extract_set_parameter.(constr, state, input, noise), (:X, :U, :W))
-        _, var_names = constructor_input(lhs, ordered_rhs, ordered_set)
-        sys = Expr(:call, :(_create_system), esc.(var_names)...)
+        field_names, var_names = constructor_input(lhs, ordered_rhs, ordered_set)
+        sys_type = _corresponding_type(AT, field_names, is_parametric)
+        sys = Expr(:call, sys_type, esc.(var_names)...)
         if isnothing(x0)
             return esc(sys)
         else
@@ -946,14 +987,20 @@ macro ivp(expr...)
             ivp = Expr(:call, InitialValueProblem, :($(expr[1])), :($x0))
             return esc(ivp)
         else
-            dyn_eq, AT, constr, state, input, noise, dim, x0 = _parse_system(expr)
-            sys_type, var_names = _get_system_type(dyn_eq, AT, constr, state, input, noise, dim)
-            sys = Expr(:call, :($sys_type), :($(var_names...)))
+            dyn_eq, AT, constr, state, input, noise, dim, x0, is_parametric, param_defs = _parse_system(expr)
+            lhs, rhs = extract_dyn_equation_parameters(dyn_eq, state, input, noise, dim, AT,
+                                                     param_defs)
+            ordered_rhs = _sort(rhs, (:A, :B, :c, :D, :f, :statedim, :inputdim, :noisedim))
+            ordered_set = _sort(extract_set_parameter.(constr, state, input, noise),
+                                (:X, :U, :W))
+            field_names, var_names = constructor_input(lhs, ordered_rhs, ordered_set)
+            sys_type = _corresponding_type(AT, field_names, is_parametric)
+            sys = Expr(:call, sys_type, esc.(var_names)...)
             if isnothing(x0)
                 return throw(ArgumentError("an initial-value problem should define the " *
                                            "initial states, but such expression was not found"))
             else
-                ivp = Expr(:call, InitialValueProblem, :($sys), :($x0))
+                ivp = Expr(:call, InitialValueProblem, :($sys), esc(:($x0)))
                 return esc(ivp)
             end
         end
