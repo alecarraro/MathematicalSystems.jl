@@ -777,7 +777,7 @@ function _get_system_type(dyn_eq, AT, constr, state, input, noise, dim)
     lhs, rhs = extract_dyn_equation_parameters(dyn_eq, state, input, noise, dim, AT)
 
     # normal set constraints and parameter definitions
-    set_constraints = []
+    set_constraints = Vector{Expr}()
     param_defs = Dict{Symbol,Any}()
 
     # candidate parameter symbols
@@ -803,7 +803,7 @@ function _get_system_type(dyn_eq, AT, constr, state, input, noise, dim)
     is_parametric = !isempty(param_defs)
 
     # update rhs with parameter values
-    new_rhs = []
+    new_rhs = Vector{Tuple{Any,Symbol}}()
     for (p_val, p_field) in rhs
         if p_val isa Expr && p_val.head == :call && length(p_val.args) > 1 &&
            haskey(param_defs, p_val.args[2])
