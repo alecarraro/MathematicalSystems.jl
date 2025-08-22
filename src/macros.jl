@@ -148,7 +148,8 @@ julia> _corresponding_type(AbstractContinuousSystem, ((:A), (:B), (:X), (:U)))
 ConstrainedLinearControlContinuousSystem
 ```
 """
-function _corresponding_type(AT::Type{<:AbstractSystem}, fields::Tuple)
+function _corresponding_type(AT::Type{<:AbstractSystem}, fields::Tuple;
+                              is_parametric::Bool=false)
     TYPES = types_table(AT)
     FIELDS = fields_table(AT)
     idx = findall(x -> issetequal(fields, x), FIELDS)
@@ -156,8 +157,21 @@ function _corresponding_type(AT::Type{<:AbstractSystem}, fields::Tuple)
         throw(ArgumentError("the entry $(fields) does not match a " *
                             "`MathematicalSystems.jl` structure"))
     end
-    @assert length(idx) == 1 "found more than one compatible system type"
-    return TYPES[idx][1]
+
+    # filter by isparametric trait
+    filtered_idx = filter(i -> isparametric(TYPES[i]) == is_parametric, idx)
+
+    if isempty(filtered_idx)
+        throw(ArgumentError("the entry $(fields) does not match a " *
+                            "`MathematicalSystems.jl` structure for " *
+                            "is_parametric=$(is_parametric)"))
+    end
+
+    if length(filtered_idx) > 1
+        throw(ArgumentError("found more than one compatible system type for " *
+                            "is_parametric=$(is_parametric): $(TYPES[filtered_idx])"))
+    end
+    return TYPES[filtered_idx[1]]
 end
 
 """
@@ -694,8 +708,9 @@ function extract_set_parameter(expr, state, input, noise) # input => to check se
         elseif x == noise
             return Set, :W
         else
-            error("$expr is not a valid set constraint definition; it does not contain " *
-                  "the state $state, the input $input or noise term $noise")
+            # error out because this function is only used for set constraints
+            throw(ArgumentError("$expr is not a valid set constraint definition; it does not contain " *
+                                "the state $state, the input $input or noise term $noise"))
         end
     end
     throw(ArgumentError("the set entry $(expr) does not have the correct form `x_ ∈ X_`"))
@@ -755,6 +770,59 @@ function _sort(parameters::Vector{<:Tuple{Any,Symbol}}, order::NTuple{N,Symbol})
         end
     end
     return order_parameters
+end
+
+# this function is used by the @system and @ivp macros
+function _get_system_type(dyn_eq, AT, constr, state, input, noise, dim)
+    lhs, rhs = extract_dyn_equation_parameters(dyn_eq, state, input, noise, dim, AT)
+
+    # normal set constraints and parameter definitions
+    set_constraints = []
+    param_defs = Dict{Symbol,Any}()
+
+    # candidate parameter symbols
+    param_symbols = Any[]
+    for (p_val, p_field) in rhs
+        if p_val isa Expr && p_val.head == :call && length(p_val.args) > 1
+            push!(param_symbols, p_val.args[2])
+        elseif p_val isa Symbol
+            push!(param_symbols, p_val)
+        end
+    end
+
+    for ex in constr
+        if @capture(ex, p_ ∈ S_)
+            if p in param_symbols
+                param_defs[p] = S
+            else
+                push!(set_constraints, ex)
+            end
+        end
+    end
+
+    is_parametric = !isempty(param_defs)
+
+    # update rhs with parameter values
+    new_rhs = []
+    for (p_val, p_field) in rhs
+        if p_val isa Expr && p_val.head == :call && length(p_val.args) > 1 &&
+           haskey(param_defs, p_val.args[2])
+            new_p_val = param_defs[p_val.args[2]]
+            push!(new_rhs, (new_p_val, p_field))
+        else
+            push!(new_rhs, (p_val, p_field))
+        end
+    end
+
+    ordered_rhs = _sort(new_rhs, (:A, :B, :c, :D, :f, :statedim, :inputdim, :noisedim))
+
+    # split constraints into sets and parameter definitions
+    ordered_set = _sort(extract_set_parameter.(set_constraints, state, input, noise),
+                        (:X, :U, :W))
+
+    field_names, var_names = constructor_input(lhs, ordered_rhs, ordered_set)
+    sys_type = _corresponding_type(AT, field_names; is_parametric=is_parametric)
+    return sys_type, var_names
 end
 
 """
@@ -874,15 +942,13 @@ ConstrainedBlackBoxControlDiscreteSystem{typeof(f), BallInf{Float64, Vector{Floa
 macro system(expr...)
     try
         dyn_eq, AT, constr, state, input, noise, dim, x0 = _parse_system(expr)
-        lhs, rhs = extract_dyn_equation_parameters(dyn_eq, state, input, noise, dim, AT)
-        ordered_rhs = _sort(rhs, (:A, :B, :c, :D, :f, :statedim, :inputdim, :noisedim))
-        ordered_set = _sort(extract_set_parameter.(constr, state, input, noise), (:X, :U, :W))
-        _, var_names = constructor_input(lhs, ordered_rhs, ordered_set)
-        sys = Expr(:call, :(_create_system), esc.(var_names)...)
+        sys_type, var_names = _get_system_type(dyn_eq, AT, constr, state, input, noise, dim)
+        sys = Expr(:call, sys_type, esc.(var_names)...)
+
         if isnothing(x0)
             return esc(sys)
         else
-            ivp = Expr(:call, InitialValueProblem, :($sys), :($x0))
+            ivp = Expr(:call, InitialValueProblem, :($sys), esc(:($x0)))
             return esc(ivp)
         end
     catch ex
@@ -948,12 +1014,12 @@ macro ivp(expr...)
         else
             dyn_eq, AT, constr, state, input, noise, dim, x0 = _parse_system(expr)
             sys_type, var_names = _get_system_type(dyn_eq, AT, constr, state, input, noise, dim)
-            sys = Expr(:call, :($sys_type), :($(var_names...)))
+            sys = Expr(:call, :($sys_type), esc.(var_names)...)
             if isnothing(x0)
                 return throw(ArgumentError("an initial-value problem should define the " *
                                            "initial states, but such expression was not found"))
             else
-                ivp = Expr(:call, InitialValueProblem, :($sys), :($x0))
+                ivp = Expr(:call, InitialValueProblem, :($sys), esc(:($x0)))
                 return esc(ivp)
             end
         end

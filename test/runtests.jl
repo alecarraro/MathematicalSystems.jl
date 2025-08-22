@@ -54,6 +54,9 @@ end
 @testset "@system macro" begin
     include("@system.jl")
 end
+@testset "Parametric systems" begin
+    include("parametric.jl")
+end
 @testset "@ivp macro" begin
     include("@ivp.jl")
 end
