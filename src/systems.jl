@@ -3423,20 +3423,29 @@ for (Z, AZ) in
     ((:LinearControlParametricContinuousSystem, :AbstractContinuousSystem),
      (:LinearControlParametricDiscreteSystem, :AbstractDiscreteSystem))
     @eval begin
-        struct $(Z){MTA,MTB} <: $(AZ)
+        struct $(Z){MTA,MTB,UT} <: $(AZ)
             AS::MTA
             BS::MTB
+            U::UT
 
-            function $(Z)(AS::MTA, BS::MTB) where {MTA,MTB}
+            function $(Z)(AS::MTA, BS::MTB, U::UT) where {MTA,MTB,UT}
                 if checksquare(AS) != size(BS, 1)
                     throw(DimensionMismatch("incompatible dimensions"))
                 end
-                return new{MTA,MTB}(AS, BS)
+                return new{MTA,MTB,UT}(AS, BS, U)
             end
         end
 
+        function $(Z)(AS::MTA, BS::MTB) where {MTA,MTB}
+            return $(Z)(AS, BS, nothing)
+        end
+
+        function $(Z)(AS::Number, BS::Number, U)
+            return $(Z)(hcat(AS), hcat(BS), U)
+        end
+
         function $(Z)(AS::Number, BS::Number)
-            return $(Z)(hcat(AS), hcat(BS))
+            return $(Z)(hcat(AS), hcat(BS), nothing)
         end
 
         function statedim(s::$Z)
@@ -3453,6 +3462,9 @@ for (Z, AZ) in
         end
         function input_matrix(s::$Z)
             return s.BS
+        end
+        function inputset(s::$Z)
+            return s.U
         end
     end
 
