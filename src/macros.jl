@@ -719,13 +719,21 @@ end
 # tuple of symbols where the field name is either `:X`, `:U` or `:W` and
 # the variable name is the value parsed as Set_
 function extract_set_parameter(expr, state, input, noise, parametric) # input => to check set definitions
+    _unescape(x) = (x isa Expr && x.head == :escape) ? x.args[1] : x
+    _same_symbol(x, y) = _unescape(x) == y || string(_unescape(x)) == string(y)
+
     if parametric
         if @capture(expr, A ∈ Set_)
             return Set, :AS
         elseif @capture(expr, B ∈ Set_)
             return Set, :BS
-        elseif @capture(expr, x_ ∈ Set_) && x == input
-            return Set, :U
+        elseif @capture(expr, x_ ∈ Set_)
+            if _same_symbol(x, input)
+                return Set, :U
+            else
+                throw(ArgumentError("$expr is not a valid parametric set constraint definition; " *
+                                    "it does not contain the input term $input"))
+            end
         end
     elseif @capture(expr, x_ ∈ Set_)
         if x == state
